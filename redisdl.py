@@ -1,12 +1,9 @@
 #!/usr/bin/env python
 
-try:
-    import json
-except ImportError:
-    import simplejson as json
-import redis
 import sys
-import functools
+import ast
+import time
+import redis
 
 py3 = sys.version_info[0] == 3
 
@@ -15,22 +12,26 @@ if py3:
 else:
     base_exception_class = StandardError
 
+
 class UnknownTypeError(base_exception_class):
     pass
+
 
 class ConcurrentModificationError(base_exception_class):
     pass
 
-# internal exceptions
 
+# internal exceptions
 class KeyDeletedError(base_exception_class):
     pass
+
 
 class KeyTypeChangedError(base_exception_class):
     pass
 
+
 def client(host='localhost', port=6379, password=None, db=0,
-                 unix_socket_path=None, encoding='utf-8'):
+           unix_socket_path=None, encoding='utf-8'):
     if unix_socket_path is not None:
         r = redis.Redis(unix_socket_path=unix_socket_path,
                         password=password,
@@ -44,6 +45,7 @@ def client(host='localhost', port=6379, password=None, db=0,
                         charset=encoding)
     return r
 
+
 def dumps(host='localhost', port=6379, password=None, db=0, pretty=False,
           unix_socket_path=None, encoding='utf-8'):
     r = client(host=host, port=port, password=password, db=db,
@@ -54,42 +56,17 @@ def dumps(host='localhost', port=6379, password=None, db=0, pretty=False,
     else:
         kwargs['indent'] = 2
         kwargs['sort_keys'] = True
-    encoder = json.JSONEncoder(**kwargs)
     table = {}
-    for key, type, value in _reader(r, pretty, encoding):
-        table[key] = {'type': type, 'value': value}
-    return encoder.encode(table)
+    for key, type, expireat, value in _reader(r, pretty):
+        table[key] = {'type': type, 'expireat': expireat, 'value': value}
+    return repr(table)
+
 
 def dump(fp, host='localhost', port=6379, password=None, db=0, pretty=False,
          unix_socket_path=None, encoding='utf-8'):
-    if pretty:
-        # hack to avoid implementing pretty printing
-        fp.write(dumps(host=host, port=port, password=password, db=db,
-            pretty=pretty, encoding=encoding))
-        return
+    fp.write(dumps(host=host, port=port, password=password, db=db,
+                   pretty=pretty, encoding=encoding))
 
-    r = client(host=host, port=port, password=password, db=db,
-               unix_socket_path=unix_socket_path, encoding=encoding)
-    kwargs = {}
-    if not pretty:
-        kwargs['separators'] = (',', ':')
-    else:
-        kwargs['indent'] = 2
-        kwargs['sort_keys'] = True
-    encoder = json.JSONEncoder(**kwargs)
-    fp.write('{')
-    first = True
-    for key, type, value in _reader(r, pretty, encoding):
-        key = encoder.encode(key)
-        type = encoder.encode(type)
-        value = encoder.encode(value)
-        item = '%s:{"type":%s,"value":%s}' % (key, type, value)
-        if first:
-            first = False
-        else:
-            fp.write(',')
-        fp.write(item)
-    fp.write('}')
 
 class StringReader(object):
     @staticmethod
@@ -97,10 +74,11 @@ class StringReader(object):
         p.get(key)
 
     @staticmethod
-    def handle_response(response, pretty, encoding):
+    def handle_response(response, pretty):
         # if key does not exist, get will return None;
         # however, our type check requires that the key exists
-        return response.decode(encoding)
+        return response
+
 
 class ListReader(object):
     @staticmethod
@@ -108,8 +86,9 @@ class ListReader(object):
         p.lrange(key, 0, -1)
 
     @staticmethod
-    def handle_response(response, pretty, encoding):
-        return [v.decode(encoding) for v in response]
+    def handle_response(response, pretty):
+        return response
+
 
 class SetReader(object):
     @staticmethod
@@ -117,11 +96,12 @@ class SetReader(object):
         p.smembers(key)
 
     @staticmethod
-    def handle_response(response, pretty, encoding):
-        value = [v.decode(encoding) for v in response]
+    def handle_response(response, pretty):
+        response = list(response)
         if pretty:
-            value.sort()
-        return value
+            response.sort()
+        return response
+
 
 class ZsetReader(object):
     @staticmethod
@@ -129,8 +109,9 @@ class ZsetReader(object):
         p.zrange(key, 0, -1, False, True)
 
     @staticmethod
-    def handle_response(response, pretty, encoding):
-        return [(k.decode(encoding), score) for k, score in response]
+    def handle_response(response, pretty):
+        return response
+
 
 class HashReader(object):
     @staticmethod
@@ -138,11 +119,8 @@ class HashReader(object):
         p.hgetall(key)
 
     @staticmethod
-    def handle_response(response, pretty, encoding):
-        value = {}
-        for k in response:
-            value[k.decode(encoding)] = response[k].decode(encoding)
-        return value
+    def handle_response(response, pretty):
+        return response
 
 readers = {
     'string': StringReader,
@@ -152,9 +130,10 @@ readers = {
     'hash': HashReader,
 }
 
+
 # note: key is a byte string
-def _read_key(key, r, pretty, encoding):
-    type = r.type(key).decode('ascii')
+def _read_key(key, r, pretty):
+    type = r.type(key)
     if type == 'none':
         # key was deleted by a concurrent operation on the data store
         raise KeyDeletedError
@@ -165,24 +144,27 @@ def _read_key(key, r, pretty, encoding):
     p.watch(key)
     p.multi()
     p.type(key)
+    p.ttl(key)
     reader.send_command(p, key)
     # might raise redis.WatchError
     results = p.execute()
-    actual_type = results[0].decode('ascii')
+    actual_type = results[0]
     if actual_type != type:
         # type changed, retry
         raise KeyTypeChangedError
-    value = reader.handle_response(results[1], pretty, encoding)
-    return (type, value)
+    ttl = results[1]
+    expireat = int(time.time() + ttl) if ttl >= 0 else None
+    value = reader.handle_response(results[2], pretty)
+    return (type, expireat, value)
 
-def _reader(r, pretty, encoding):
-    for encoded_key in r.keys():
-        key = encoded_key.decode(encoding)
+
+def _reader(r, pretty):
+    for key in r.keys():
         handled = False
         for i in range(10):
             try:
-                type, value = _read_key(encoded_key, r, pretty, encoding)
-                yield key, type, value
+                type, expireat, value = _read_key(key, r, pretty)
+                yield key, type, expireat, value
                 handled = True
                 break
             except KeyDeletedError:
@@ -197,11 +179,14 @@ def _reader(r, pretty, encoding):
                 pass
         if not handled:
             # ran out of retries
-            raise ConcurrentModificationError('Key %s is being concurrently modified' % key)
+            raise ConcurrentModificationError(
+                'Key %s is being concurrently modified' % key)
+
 
 def _empty(r):
     for key in r.keys():
         r.delete(key)
+
 
 def loads(s, host='localhost', port=6379, password=None, db=0, empty=False,
           unix_socket_path=None, encoding='utf-8'):
@@ -209,7 +194,7 @@ def loads(s, host='localhost', port=6379, password=None, db=0, empty=False,
                unix_socket_path=unix_socket_path, encoding=encoding)
     if empty:
         _empty(r)
-    table = json.loads(s)
+    table = ast.literal_eval(s)
     counter = 0
     for key in table:
         # Create pipeline:
@@ -217,8 +202,9 @@ def loads(s, host='localhost', port=6379, password=None, db=0, empty=False,
             p = r.pipeline(transaction=False)
         item = table[key]
         type = item['type']
+        expireat = item['expireat']
         value = item['value']
-        _writer(p, key, type, value)
+        _writer(p, key, type, expireat, value)
         # Increase counter until 10 000...
         counter = (counter + 1) % 10000
         # ... then execute:
@@ -228,12 +214,14 @@ def loads(s, host='localhost', port=6379, password=None, db=0, empty=False,
         # Finally, execute again:
         p.execute()
 
+
 def load(fp, host='localhost', port=6379, password=None, db=0, empty=False,
          unix_socket_path=None, encoding='utf-8'):
     s = fp.read()
     loads(s, host, port, password, db, empty, unix_socket_path, encoding)
 
-def _writer(r, key, type, value):
+
+def _writer(r, key, type, expireat, value):
     r.delete(key)
     if type == 'string':
         r.set(key, value)
@@ -250,6 +238,9 @@ def _writer(r, key, type, value):
         r.hmset(key, value)
     else:
         raise UnknownTypeError("Unknown key type: %s" % type)
+    if expireat:
+        r.expireat(key, expireat)
+
 
 if __name__ == '__main__':
     import optparse
@@ -319,7 +310,7 @@ if __name__ == '__main__':
 
     if help == LOAD:
         usage = "Usage: %prog [options] [FILE]"
-        usage += "\n\nLoad data from FILE (which must be a JSON dump previously created"
+        usage += "\n\nLoad data from FILE (which must be a Python object dump previously created"
         usage += "\nby redisdl) into specified or default redis."
         usage += "\n\nIf FILE is omitted standard input is read."
     elif help == DUMP:
